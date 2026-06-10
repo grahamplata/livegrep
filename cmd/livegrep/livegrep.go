@@ -31,7 +31,17 @@ func runfilesPath(sourcePath string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return path.Join(programPath+".runfiles", "com_github_livegrep_livegrep", sourcePath), nil
+	runfilesDir := programPath + ".runfiles"
+
+	// Try new runfiles layout first (_main)
+	newPath := path.Join(runfilesDir, "_main", sourcePath)
+	if _, err := os.Stat(newPath); err == nil {
+		return newPath, nil
+	}
+
+	// Fall back to old runfiles layout
+	oldPath := path.Join(runfilesDir, "com_github_livegrep_livegrep", sourcePath)
+	return oldPath, nil
 }
 
 func main() {
