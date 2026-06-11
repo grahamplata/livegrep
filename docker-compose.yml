@@ -12,10 +12,13 @@
 #   docker compose up                     # backend + web UI at http://localhost:8910
 #
 
+x-base: &base
+  image: ghcr.io/livegrep/livegrep/base:latest
+  platform: linux/amd64
+
 services:
   codesearch:
-    image: livegrep/base:latest
-    platform: linux/amd64
+    <<: *base
     working_dir: /repo
     # Index this repo using the bundled example config (indexes src/ and the
     # git HEAD of the repo) and serve gRPC on all interfaces.
@@ -27,8 +30,7 @@ services:
       - "${CODESEARCH_PORT:-9999}:9999"
 
   web:
-    image: livegrep/base:latest
-    platform: linux/amd64
+    <<: *base
     depends_on:
       - codesearch
     command: ["/livegrep/bin/livegrep", "-listen", "0.0.0.0:8910", "-connect", "codesearch:9999", "-docroot", "/livegrep/web"]
