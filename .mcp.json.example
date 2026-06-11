@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "livegrep": {
+      "command": "/ABSOLUTE/PATH/TO/REPO/bazel-bin/cmd/livegrep-mcp-server/livegrep-mcp-server_/livegrep-mcp-server",
+      "args": ["-backend", "localhost:9999"]
+    }
+  }
+}

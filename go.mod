@@ -1,8 +1,6 @@
 module github.com/livegrep/livegrep
 
-go 1.23.0
-
-toolchain go1.23.6
+go 1.25.5
 
 require (
 	github.com/bazelbuild/rules_go v0.55.1
@@ -25,6 +23,7 @@ require (
 	github.com/klauspost/compress v1.17.11 // indirect
 	github.com/kr/pretty v0.2.1 // indirect
 	github.com/kr/text v0.1.0 // indirect
+	github.com/mark3labs/mcp-go v0.1.0 // indirect
 	github.com/vmihailenco/msgpack/v5 v5.4.1 // indirect
 	github.com/vmihailenco/tagparser/v2 v2.0.0 // indirect
 	golang.org/x/sys v0.34.0 // indirect

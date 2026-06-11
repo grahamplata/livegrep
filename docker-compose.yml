@@ -1,0 +1,38 @@
+# Local livegrep stack for developing/validating livegrep-mcp-server.
+#
+# Provides the C++ `codesearch` backend (from the public livegrep/base image)
+# indexing this repo, plus the livegrep web UI. The mcp-server itself is a
+# stdio process spawned by an MCP client, so it is not a long-running service
+# here; run it on the host against the exposed backend on localhost:9999, e.g.:
+#
+#   bazel run //cmd/livegrep-mcp-server -- -backend localhost:9999
+#
+# Usage:
+#   docker compose up codesearch          # backend only (what the mcp-server needs)
+#   docker compose up                     # backend + web UI at http://localhost:8910
+#
+
+x-base: &base
+  image: ghcr.io/livegrep/livegrep/base:latest
+  platform: linux/amd64
+
+services:
+  codesearch:
+    <<: *base
+    working_dir: /repo
+    # Index this repo using the bundled example config (indexes src/ and the
+    # git HEAD of the repo) and serve gRPC on all interfaces.
+    command: ["/livegrep/bin/codesearch", "-grpc", "0.0.0.0:9999", "doc/examples/livegrep/index.json"]
+    volumes:
+      - .:/repo:ro
+    # Override the host port if 9999 is already in use: CODESEARCH_PORT=19999 docker compose up
+    ports:
+      - "${CODESEARCH_PORT:-9999}:9999"
+
+  web:
+    <<: *base
+    depends_on:
+      - codesearch
+    command: ["/livegrep/bin/livegrep", "-listen", "0.0.0.0:8910", "-connect", "codesearch:9999", "-docroot", "/livegrep/web"]
+    ports:
+      - "${WEB_PORT:-8910}:8910"
