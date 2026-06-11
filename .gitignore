@@ -16,3 +16,6 @@ vendor/re2/obj/libre2.a
 /bazel-*
 compile_commands.json
 .devbox
+
+# Local MCP client config (copy from .mcp.json.example)
+.mcp.json

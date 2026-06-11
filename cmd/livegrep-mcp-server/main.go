@@ -1,11 +1,15 @@
+// Command livegrep-mcp-server exposes a livegrep codesearch backend over the
+// Model Context Protocol (MCP) using newline-delimited JSON-RPC 2.0 on stdio.
 package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"time"
@@ -15,9 +19,22 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-var (
-	backendAddr = flag.String("backend", "localhost:9999", "codesearch gRPC address")
+const (
+	protocolVersion = "2024-11-05"
+	serverName      = "livegrep-mcp-server"
+	serverVersion   = "1.0.0"
+
+	defaultMaxMatches   = 100
+	defaultContextLines = 2
+	searchTimeout       = 30 * time.Second
+	infoTimeout         = 10 * time.Second
 )
+
+var backendAddr = flag.String("backend", "localhost:9999", "codesearch gRPC address")
+
+// ---------------------------------------------------------------------------
+// Tool argument and result types
+// ---------------------------------------------------------------------------
 
 type CodeSearchArgs struct {
 	Query         string  `json:"query"`
@@ -34,30 +51,28 @@ type SearchFileArgs struct {
 	MaxMatches float64 `json:"max_matches"`
 }
 
-type GetReposArgs struct{}
-
 type SearchResult struct {
-	Repo            string   `json:"repo"`
-	Path            string   `json:"path"`
-	Line            int64    `json:"line"`
-	Content         string   `json:"content"`
-	MatchBounds     [2]int   `json:"match_bounds"`
-	ContextBefore   []string `json:"context_before"`
-	ContextAfter    []string `json:"context_after"`
+	Repo          string   `json:"repo"`
+	Path          string   `json:"path"`
+	Line          int64    `json:"line"`
+	Content       string   `json:"content"`
+	MatchBounds   [2]int   `json:"match_bounds"`
+	ContextBefore []string `json:"context_before"`
+	ContextAfter  []string `json:"context_after"`
 }
 
 type SearchResponse struct {
-	Results []SearchResult            `json:"results"`
+	Results []SearchResult         `json:"results"`
 	Stats   map[string]interface{} `json:"stats"`
 }
 
 type FileResult struct {
-	Repo  string `json:"repo"`
-	Path  string `json:"path"`
+	Repo string `json:"repo"`
+	Path string `json:"path"`
 }
 
 type FileSearchResponse struct {
-	Results []FileResult              `json:"results"`
+	Results []FileResult           `json:"results"`
 	Stats   map[string]interface{} `json:"stats"`
 }
 
@@ -69,7 +84,10 @@ type RepoResponse struct {
 	Repos []RepoInfo `json:"repos"`
 }
 
-// JSON-RPC 2.0 types
+// ---------------------------------------------------------------------------
+// JSON-RPC 2.0 / MCP protocol types
+// ---------------------------------------------------------------------------
+
 type Request struct {
 	JSONRPC string          `json:"jsonrpc"`
 	ID      interface{}     `json:"id"`
@@ -78,10 +96,10 @@ type Request struct {
 }
 
 type Response struct {
-	JSONRPC string          `json:"jsonrpc"`
-	ID      interface{}     `json:"id,omitempty"`
-	Result  interface{}     `json:"result,omitempty"`
-	Error   *JSONRPCError   `json:"error,omitempty"`
+	JSONRPC string        `json:"jsonrpc"`
+	ID      interface{}   `json:"id"`
+	Result  interface{}   `json:"result,omitempty"`
+	Error   *JSONRPCError `json:"error,omitempty"`
 }
 
 type JSONRPCError struct {
@@ -104,22 +122,128 @@ type ToolCallRequest struct {
 	Arguments map[string]interface{} `json:"arguments"`
 }
 
-var client pb.CodeSearchClient
-
-func sendResponse(w *bufio.Writer, id interface{}, result interface{}, errMsg *JSONRPCError) error {
-	resp := Response{
-		JSONRPC: "2.0",
-		ID:      id,
-		Result:  result,
-		Error:   errMsg,
-	}
-	if err := json.NewEncoder(w).Encode(resp); err != nil {
-		return err
-	}
-	return w.Flush()
+// ToolContent and ToolCallResult model the MCP tools/call result envelope.
+type ToolContent struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
 }
 
-func handleToolsList(w *bufio.Writer, id interface{}) error {
+type ToolCallResult struct {
+	Content []ToolContent `json:"content"`
+	IsError bool          `json:"isError,omitempty"`
+}
+
+// JSON-RPC standard error codes.
+const (
+	errParse          = -32700
+	errInvalidRequest = -32600
+	errMethodNotFound = -32601
+)
+
+// ---------------------------------------------------------------------------
+// Server
+// ---------------------------------------------------------------------------
+
+// Server handles MCP requests, delegating searches to a codesearch backend.
+// The backend is the generated pb.CodeSearchClient interface so it can be
+// replaced with a fake in tests.
+type Server struct {
+	client pb.CodeSearchClient
+}
+
+func NewServer(client pb.CodeSearchClient) *Server {
+	return &Server{client: client}
+}
+
+// Serve reads newline-delimited JSON-RPC requests from in and writes responses
+// to out until in is exhausted (EOF) or a read/write error occurs.
+func (s *Server) Serve(ctx context.Context, in io.Reader, out io.Writer) error {
+	reader := bufio.NewReader(in)
+	encoder := json.NewEncoder(out)
+
+	for {
+		line, err := reader.ReadBytes('\n')
+		if trimmed := bytes.TrimSpace(line); len(trimmed) > 0 {
+			if resp := s.process(ctx, trimmed); resp != nil {
+				if encErr := encoder.Encode(resp); encErr != nil {
+					return encErr
+				}
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				return nil
+			}
+			return err
+		}
+	}
+}
+
+// process parses a single JSON-RPC message and returns the response to send,
+// or nil if the message is a notification that requires no response.
+func (s *Server) process(ctx context.Context, line []byte) *Response {
+	var req Request
+	if err := json.Unmarshal(line, &req); err != nil {
+		log.Printf("parse error: %v", err)
+		return errorResponse(nil, errParse, "Parse error")
+	}
+	return s.handleRequest(ctx, &req)
+}
+
+// handleRequest dispatches a parsed request. It returns nil for notifications
+// (any method under "notifications/", or any request without an id), which per
+// the JSON-RPC spec must not receive a response.
+func (s *Server) handleRequest(ctx context.Context, req *Request) *Response {
+	isNotification := req.ID == nil
+
+	if req.JSONRPC != "2.0" {
+		if isNotification {
+			return nil
+		}
+		log.Printf("invalid JSON-RPC version: %q", req.JSONRPC)
+		return errorResponse(req.ID, errInvalidRequest, "Invalid Request")
+	}
+
+	log.Printf("[%v] %s", req.ID, req.Method)
+
+	switch req.Method {
+	case "initialize":
+		return s.handleInitialize(req.ID)
+	case "notifications/initialized":
+		return nil
+	case "ping":
+		return successResponse(req.ID, struct{}{})
+	case "tools/list":
+		return s.handleToolsList(req.ID)
+	case "tools/call":
+		var call ToolCallRequest
+		if err := json.Unmarshal(req.Params, &call); err != nil {
+			return errorResponse(req.ID, errInvalidRequest, "Invalid arguments")
+		}
+		return s.handleToolCall(ctx, req.ID, call)
+	default:
+		if isNotification {
+			return nil
+		}
+		log.Printf("unknown method: %s", req.Method)
+		return errorResponse(req.ID, errMethodNotFound, "Method not found")
+	}
+}
+
+func (s *Server) handleInitialize(id interface{}) *Response {
+	return successResponse(id, map[string]interface{}{
+		"protocolVersion": protocolVersion,
+		"capabilities": map[string]interface{}{
+			"tools": map[string]interface{}{},
+		},
+		"serverInfo": map[string]interface{}{
+			"name":    serverName,
+			"version": serverVersion,
+		},
+	})
+}
+
+func (s *Server) handleToolsList(id interface{}) *Response {
 	tools := []ToolDescriptor{
 		{
 			Name:        "code_search",
@@ -187,195 +311,202 @@ func handleToolsList(w *bufio.Writer, id interface{}) error {
 			},
 		},
 	}
-
-	return sendResponse(w, id, ToolsListResult{Tools: tools}, nil)
+	return successResponse(id, ToolsListResult{Tools: tools})
 }
 
-func handleToolCall(w *bufio.Writer, id interface{}, call ToolCallRequest) error {
+func (s *Server) handleToolCall(ctx context.Context, id interface{}, call ToolCallRequest) *Response {
+	var (
+		payload interface{}
+		err     error
+	)
 	switch call.Name {
 	case "code_search":
-		return handleCodeSearch(w, id, call.Arguments)
+		payload, err = s.codeSearch(ctx, call.Arguments)
 	case "search_files":
-		return handleSearchFiles(w, id, call.Arguments)
+		payload, err = s.searchFiles(ctx, call.Arguments)
 	case "get_repos":
-		return handleGetRepos(w, id, call.Arguments)
+		payload, err = s.getRepos(ctx)
 	default:
-		return sendResponse(w, id, nil, &JSONRPCError{
-			Code:    -32601,
-			Message: fmt.Sprintf("Method not found: %s", call.Name),
-		})
+		return errorResponse(id, errMethodNotFound, fmt.Sprintf("Unknown tool: %s", call.Name))
 	}
+	return toolResponse(id, payload, err)
 }
 
-func handleInitialize(w *bufio.Writer, id interface{}) error {
-	result := map[string]interface{}{
-		"protocolVersion": "2024-11-05",
-		"capabilities": map[string]interface{}{
-			"tools": map[string]interface{}{},
-		},
-		"serverInfo": map[string]interface{}{
-			"name":    "livegrep-mcp-server",
-			"version": "1.0.0",
-		},
-	}
-	return sendResponse(w, id, result, nil)
-}
+// ---------------------------------------------------------------------------
+// Tool implementations
+// ---------------------------------------------------------------------------
 
-func handleCodeSearch(w *bufio.Writer, id interface{}, args map[string]interface{}) error {
-	var searchArgs CodeSearchArgs
-	if data, err := json.Marshal(args); err != nil {
-		return sendResponse(w, id, nil, &JSONRPCError{Code: -32600, Message: "Invalid request"})
-	} else if err := json.Unmarshal(data, &searchArgs); err != nil {
-		return sendResponse(w, id, nil, &JSONRPCError{Code: -32600, Message: "Invalid arguments"})
+func (s *Server) codeSearch(ctx context.Context, args map[string]interface{}) (interface{}, error) {
+	var a CodeSearchArgs
+	if err := decodeArgs(args, &a); err != nil {
+		return nil, err
+	}
+	if a.Query == "" {
+		return nil, fmt.Errorf("query parameter is required")
 	}
 
-	if searchArgs.Query == "" {
-		return sendResponse(w, id, nil, &JSONRPCError{Code: -32602, Message: "query parameter is required"})
-	}
-
-	log.Printf("[%v] Code search query=%q repo=%q file=%q case_sensitive=%v max_matches=%v", id, searchArgs.Query, searchArgs.Repo, searchArgs.File, searchArgs.CaseSensitive, searchArgs.MaxMatches)
+	log.Printf("code_search query=%q repo=%q file=%q case_sensitive=%v max_matches=%v",
+		a.Query, a.Repo, a.File, a.CaseSensitive, a.MaxMatches)
 
 	q := &pb.Query{
-		Line:       searchArgs.Query,
-		MaxMatches: 100,
+		Line:         a.Query,
+		Repo:         a.Repo,
+		FoldCase:     !a.CaseSensitive,
+		MaxMatches:   defaultMaxMatches,
+		ContextLines: defaultContextLines,
+	}
+	if a.File != "" {
+		q.File = []string{a.File}
+	}
+	if a.MaxMatches > 0 {
+		q.MaxMatches = int32(a.MaxMatches)
+	}
+	if a.ContextLines > 0 {
+		q.ContextLines = int32(a.ContextLines)
 	}
 
-	if searchArgs.Repo != "" {
-		q.Repo = searchArgs.Repo
-	}
-
-	if searchArgs.File != "" {
-		q.File = []string{searchArgs.File}
-	}
-
-	q.FoldCase = !searchArgs.CaseSensitive
-
-	if searchArgs.MaxMatches > 0 {
-		q.MaxMatches = int32(searchArgs.MaxMatches)
-	}
-
-	if searchArgs.ContextLines > 0 {
-		q.ContextLines = int32(searchArgs.ContextLines)
-	} else {
-		q.ContextLines = 2
-	}
-
-	searchCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	searchCtx, cancel := context.WithTimeout(ctx, searchTimeout)
 	defer cancel()
 
-	result, err := client.Search(searchCtx, q)
+	result, err := s.client.Search(searchCtx, q)
 	if err != nil {
-		return sendResponse(w, id, nil, &JSONRPCError{
-			Code:    -32603,
-			Message: fmt.Sprintf("Internal error: %v", err),
-		})
+		return nil, fmt.Errorf("search failed: %w", err)
 	}
 
-	results := make([]SearchResult, 0)
+	results := make([]SearchResult, 0, len(result.Results))
 	for _, r := range result.Results {
+		var bounds [2]int
+		if r.Bounds != nil {
+			bounds = [2]int{int(r.Bounds.Left), int(r.Bounds.Right)}
+		}
 		results = append(results, SearchResult{
 			Repo:          r.Tree,
 			Path:          r.Path,
 			Line:          r.LineNumber,
 			Content:       r.Line,
-			MatchBounds:   [2]int{int(r.Bounds.Left), int(r.Bounds.Right)},
+			MatchBounds:   bounds,
 			ContextBefore: r.ContextBefore,
 			ContextAfter:  r.ContextAfter,
 		})
 	}
 
-	response := SearchResponse{
+	log.Printf("code_search completed: %d matches", len(results))
+	return SearchResponse{
 		Results: results,
 		Stats: map[string]interface{}{
-			"total_matches": len(results),
+			"total_matches":  len(results),
 			"search_time_ms": result.Stats.GetAnalyzeTime() + result.Stats.GetRe2Time(),
 		},
-	}
-
-	log.Printf("[%v] Code search completed: %d matches", id, len(results))
-	return sendResponse(w, id, response, nil)
+	}, nil
 }
 
-func handleSearchFiles(w *bufio.Writer, id interface{}, args map[string]interface{}) error {
-	var searchArgs SearchFileArgs
-	if data, err := json.Marshal(args); err != nil {
-		return sendResponse(w, id, nil, &JSONRPCError{Code: -32600, Message: "Invalid request"})
-	} else if err := json.Unmarshal(data, &searchArgs); err != nil {
-		return sendResponse(w, id, nil, &JSONRPCError{Code: -32600, Message: "Invalid arguments"})
+func (s *Server) searchFiles(ctx context.Context, args map[string]interface{}) (interface{}, error) {
+	var a SearchFileArgs
+	if err := decodeArgs(args, &a); err != nil {
+		return nil, err
+	}
+	if a.Pattern == "" {
+		return nil, fmt.Errorf("pattern parameter is required")
 	}
 
-	if searchArgs.Pattern == "" {
-		return sendResponse(w, id, nil, &JSONRPCError{Code: -32602, Message: "pattern parameter is required"})
-	}
-
-	log.Printf("[%v] File search pattern=%q repo=%q max_matches=%v", id, searchArgs.Pattern, searchArgs.Repo, searchArgs.MaxMatches)
+	log.Printf("search_files pattern=%q repo=%q max_matches=%v", a.Pattern, a.Repo, a.MaxMatches)
 
 	q := &pb.Query{
-		Line:         searchArgs.Pattern,
+		Line:         a.Pattern,
+		Repo:         a.Repo,
 		FilenameOnly: true,
-		MaxMatches:   100,
+		MaxMatches:   defaultMaxMatches,
+	}
+	if a.MaxMatches > 0 {
+		q.MaxMatches = int32(a.MaxMatches)
 	}
 
-	if searchArgs.Repo != "" {
-		q.Repo = searchArgs.Repo
-	}
-
-	if searchArgs.MaxMatches > 0 {
-		q.MaxMatches = int32(searchArgs.MaxMatches)
-	}
-
-	searchCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	searchCtx, cancel := context.WithTimeout(ctx, searchTimeout)
 	defer cancel()
 
-	result, err := client.Search(searchCtx, q)
+	result, err := s.client.Search(searchCtx, q)
 	if err != nil {
-		return sendResponse(w, id, nil, &JSONRPCError{
-			Code:    -32603,
-			Message: fmt.Sprintf("Internal error: %v", err),
-		})
+		return nil, fmt.Errorf("search failed: %w", err)
 	}
 
-	results := make([]FileResult, 0)
+	results := make([]FileResult, 0, len(result.FileResults))
 	for _, r := range result.FileResults {
-		results = append(results, FileResult{
-			Repo: r.Tree,
-			Path: r.Path,
-		})
+		results = append(results, FileResult{Repo: r.Tree, Path: r.Path})
 	}
 
-	response := FileSearchResponse{
+	log.Printf("search_files completed: %d matches", len(results))
+	return FileSearchResponse{
 		Results: results,
 		Stats: map[string]interface{}{
 			"total_matches": len(results),
 		},
-	}
-
-	log.Printf("[%v] File search completed: %d matches", id, len(results))
-	return sendResponse(w, id, response, nil)
+	}, nil
 }
 
-func handleGetRepos(w *bufio.Writer, id interface{}, args map[string]interface{}) error {
-	log.Printf("[%v] Getting available repositories", id)
-	repoCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+func (s *Server) getRepos(ctx context.Context) (interface{}, error) {
+	log.Printf("get_repos")
+
+	infoCtx, cancel := context.WithTimeout(ctx, infoTimeout)
 	defer cancel()
 
-	info, err := client.Info(repoCtx, &pb.InfoRequest{})
+	info, err := s.client.Info(infoCtx, &pb.InfoRequest{})
 	if err != nil {
-		log.Printf("[%v] Failed to get repos: %v", id, err)
-		return sendResponse(w, id, nil, &JSONRPCError{
-			Code:    -32603,
-			Message: fmt.Sprintf("Internal error: %v", err),
-		})
+		return nil, fmt.Errorf("info failed: %w", err)
 	}
 
-	repos := make([]RepoInfo, 0)
+	repos := make([]RepoInfo, 0, len(info.Trees))
 	for _, tree := range info.Trees {
 		repos = append(repos, RepoInfo{Name: tree.Name})
 	}
 
-	log.Printf("[%v] Found %d repositories", id, len(repos))
-	response := RepoResponse{Repos: repos}
-	return sendResponse(w, id, response, nil)
+	log.Printf("get_repos completed: %d repositories", len(repos))
+	return RepoResponse{Repos: repos}, nil
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+// decodeArgs converts the loosely-typed MCP argument map into a typed struct.
+func decodeArgs(args map[string]interface{}, dst interface{}) error {
+	data, err := json.Marshal(args)
+	if err != nil {
+		return fmt.Errorf("invalid arguments: %w", err)
+	}
+	if err := json.Unmarshal(data, dst); err != nil {
+		return fmt.Errorf("invalid arguments: %w", err)
+	}
+	return nil
+}
+
+func successResponse(id interface{}, result interface{}) *Response {
+	return &Response{JSONRPC: "2.0", ID: id, Result: result}
+}
+
+func errorResponse(id interface{}, code int, message string) *Response {
+	return &Response{JSONRPC: "2.0", ID: id, Error: &JSONRPCError{Code: code, Message: message}}
+}
+
+// toolResponse wraps a tool's payload (or error) in the MCP tools/call result
+// envelope. Tool errors are reported as a successful JSON-RPC response with
+// isError set, per the MCP specification.
+func toolResponse(id interface{}, payload interface{}, err error) *Response {
+	if err != nil {
+		return successResponse(id, ToolCallResult{
+			Content: []ToolContent{{Type: "text", Text: err.Error()}},
+			IsError: true,
+		})
+	}
+	data, marshalErr := json.MarshalIndent(payload, "", "  ")
+	if marshalErr != nil {
+		return successResponse(id, ToolCallResult{
+			Content: []ToolContent{{Type: "text", Text: fmt.Sprintf("failed to encode result: %v", marshalErr)}},
+			IsError: true,
+		})
+	}
+	return successResponse(id, ToolCallResult{
+		Content: []ToolContent{{Type: "text", Text: string(data)}},
+	})
 }
 
 func main() {
@@ -384,73 +515,17 @@ func main() {
 	log.SetOutput(os.Stderr)
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
-	log.Printf("Connecting to codesearch at %s", *backendAddr)
-	conn, err := grpc.Dial(*backendAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	log.Printf("connecting to codesearch at %s", *backendAddr)
+	conn, err := grpc.NewClient(*backendAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
-		log.Fatalf("Failed to connect to codesearch: %v", err)
+		log.Fatalf("failed to create codesearch client: %v", err)
 	}
 	defer conn.Close()
 
-	client = pb.NewCodeSearchClient(conn)
-	log.Printf("Connected to codesearch backend")
+	srv := NewServer(pb.NewCodeSearchClient(conn))
+	log.Printf("serving MCP on stdio")
 
-	scanner := bufio.NewScanner(os.Stdin)
-	writer := bufio.NewWriter(os.Stdout)
-
-	for scanner.Scan() {
-		var req Request
-		line := scanner.Bytes()
-
-		if err := json.Unmarshal(line, &req); err != nil {
-			log.Printf("Failed to parse request: %v", err)
-			sendResponse(writer, nil, nil, &JSONRPCError{
-				Code:    -32700,
-				Message: "Parse error",
-			})
-			continue
-		}
-
-		log.Printf("[%v] Received %s request", req.ID, req.Method)
-
-		if req.JSONRPC != "2.0" {
-			log.Printf("Invalid JSON-RPC version: %s", req.JSONRPC)
-			sendResponse(writer, req.ID, nil, &JSONRPCError{
-				Code:    -32600,
-				Message: "Invalid Request",
-			})
-			continue
-		}
-
-		switch req.Method {
-		case "initialize":
-			log.Printf("[%v] Handling initialize", req.ID)
-			handleInitialize(writer, req.ID)
-		case "tools/list":
-			log.Printf("[%v] Listing available tools", req.ID)
-			handleToolsList(writer, req.ID)
-		case "tools/call":
-			var call ToolCallRequest
-			if err := json.Unmarshal(req.Params, &call); err != nil {
-				log.Printf("[%v] Failed to parse tool call: %v", req.ID, err)
-				sendResponse(writer, req.ID, nil, &JSONRPCError{
-					Code:    -32600,
-					Message: "Invalid arguments",
-				})
-			} else {
-				log.Printf("[%v] Calling tool: %s with args: %v", req.ID, call.Name, call.Arguments)
-				handleToolCall(writer, req.ID, call)
-				log.Printf("[%v] Tool call completed", req.ID)
-			}
-		default:
-			log.Printf("Unknown method: %s", req.Method)
-			sendResponse(writer, req.ID, nil, &JSONRPCError{
-				Code:    -32601,
-				Message: "Method not found",
-			})
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		log.Fatalf("Scanner error: %v", err)
+	if err := srv.Serve(context.Background(), os.Stdin, os.Stdout); err != nil {
+		log.Fatalf("serve: %v", err)
 	}
 }
